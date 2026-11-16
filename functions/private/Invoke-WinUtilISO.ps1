@@ -457,6 +457,12 @@ function Invoke-WinUtilISOModify {
             Write-WinUtilISOLog "Dismounting original ISO..."
             Dismount-DiskImage -ImagePath $isoPath -ErrorAction Stop
 
+            # Marker proves this directory was produced by a completed WinUtil run, so
+            # resume detection never adopts a directory a local process merely named.
+            # Publish the $sync state only after the marker exists, so a failed marker
+            # write cannot leave the UI pointing at a directory cleanup just deleted.
+            New-Item -ItemType File -Path (Join-Path $workDir ".winutil-created") -Force -ErrorAction Stop | Out-Null
+
             $sync["Win11ISOWorkDir"]     = $workDir
             $sync["Win11ISOContentsDir"] = $isoContents
 
@@ -510,6 +516,25 @@ function Invoke-WinUtilISOModify {
     }
 }
 
+function Test-WinUtilISOWorkDirComplete {
+    # Pre-marker work is only recoverable when a finished modification's output is present;
+    # a leftover WIM mount means driver injection was interrupted.
+    param([Parameter(Mandatory)][string]$WorkDir)
+
+    $isoContents = Join-Path $WorkDir "iso_contents"
+    if (Test-Path -LiteralPath (Join-Path $WorkDir "wim_mount")) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $isoContents "sources\install.wim")) -and
+        -not (Test-Path -LiteralPath (Join-Path $isoContents "sources\install.esd"))) {
+        return $false
+    }
+
+    foreach ($relativePath in "autounattend.xml", 'sources\$OEM$\$$\Setup\Scripts\WinUtil-PostInstall.ps1') {
+        if (-not (Test-Path -LiteralPath (Join-Path $isoContents $relativePath))) { return $false }
+    }
+
+    return $true
+}
+
 function Invoke-WinUtilISOCheckExistingWork {
     if ($sync["Win11ISOContentsDir"] -and (Test-Path $sync["Win11ISOContentsDir"])) { return }
 
@@ -528,10 +553,42 @@ function Invoke-WinUtilISOCheckExistingWork {
     }
     $sync["Win11ISOExistingWorkRetryPending"] = $false
 
-    $existingWorkDir = Get-Item -Path (Join-Path $env:TEMP "WinUtil_Win11ISO*") |
-        Where-Object { $_.PSIsContainer } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    # Prefer marked work, but require consent for every adoption: an empty marker in TEMP
+    # can be planted by another process. Reject directory junctions and symlinks as well.
+    $workDirs = @(Get-Item -Path (Join-Path $env:TEMP "WinUtil_Win11ISO*") |
+        Where-Object {
+            $_.PSIsContainer -and
+            -not ([bool]($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint))
+        })
 
-    if (-not $existingWorkDir) { return }
+    $existingWorkDir = $workDirs |
+        Where-Object { (Test-Path -LiteralPath (Join-Path $_.FullName ".winutil-created")) } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $hasMarker = $null -ne $existingWorkDir
+
+    if (-not $existingWorkDir) {
+        # Directories from builds that predate the marker are never adopted automatically.
+        # Offer recovery only when the completed output is present, and write the marker only
+        # after the user explicitly consents.
+        $existingWorkDir = $workDirs |
+            Where-Object { (Test-WinUtilISOWorkDirComplete -WorkDir $_.FullName) } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+
+        if (-not $existingWorkDir) { return }
+
+    }
+
+    $confirm = Show-WinUtilMessage -Message "A previous WinUtil ISO working directory was found:`n`n$($existingWorkDir.FullName)`n`nA completion marker alone cannot verify who created or changed these files. Recover this directory only if you recognize it and the earlier run finished without errors.`n`nRecover this directory?" -Title "Recover Previous Work" -Button "YesNo" -Icon "Warning"
+    if ($confirm -ne "Yes") { return }
+
+    if (-not $hasMarker) {
+        try {
+            New-Item -ItemType File -Path (Join-Path $existingWorkDir.FullName ".winutil-created") -Force -ErrorAction Stop | Out-Null
+        } catch {
+            Write-WinUtilISOLog -Level "WARN" -Message "Could not mark the previous working directory for recovery: $_"
+            return
+        }
+    }
 
     $isoContents = Join-Path $existingWorkDir.FullName "iso_contents"
     if (-not (Test-Path $isoContents)) { return }
@@ -562,11 +619,13 @@ function Invoke-WinUtilISOCleanAndReset {
     } -ScriptBlock {
         param($workDir)
 
+        $cleanupTree = $null
         Invoke-WPFUIThread -ScriptBlock { $sync["WPFWin11ISOCleanResetButton"].IsEnabled = $false }
         Set-WinUtilISOStep -Step "Working" -Label "Starting over" -Reverse
 
         try {
             if ($workDir) {
+                Assert-WinUtilISOCleanupRoot -WorkDir $workDir
                 $mountDir = Join-Path $workDir "wim_mount"
                 try {
                     $mountedImages = Get-WindowsImage -Mounted | Where-Object { $_.Path -like "$workDir*" }
@@ -593,16 +652,16 @@ function Invoke-WinUtilISOCleanAndReset {
                 Write-WinUtilISOLog "Scanning files to delete in: $workDir"
                 Step-WinUtilJob -Status "Scanning files..." -Percent 5
 
-                $allFiles = @(Get-ChildItem -Path $workDir -File -Recurse -Force)
-                $allDirs  = @(Get-ChildItem -Path $workDir -Directory -Recurse -Force |
-                    Sort-Object { $_.FullName.Length } -Descending)
+                $cleanupTree = Get-WinUtilISOCleanupTree -WorkDir $workDir
+                $allFiles = $cleanupTree.Files
+                $allDirs = $cleanupTree.Directories
                 $total   = $allFiles.Count
                 $deleted = 0
 
                 Write-WinUtilISOLog "Found $total files to delete."
 
                 foreach ($f in $allFiles) {
-                    try { Remove-Item -Path $f.FullName -Force } catch { Write-WinUtilISOLog -Level "WARN" -Message "Could not delete $($f.FullName): $_" }
+                    try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop } catch { Write-WinUtilISOLog -Level "WARN" -Message "Could not delete $($f.FullName): $_" }
                     $deleted++
                     if ($deleted % 100 -eq 0 -or $deleted -eq $total) {
                         $pct = [math]::Round(($deleted / [Math]::Max($total, 1)) * 85) + 5
@@ -611,10 +670,12 @@ function Invoke-WinUtilISOCleanAndReset {
                 }
 
                 foreach ($d in $allDirs) {
-                    try { Remove-Item -Path $d.FullName -Force } catch { Write-WinUtilISOLog -Level "WARN" -Message "Could not delete $($d.FullName): $_" }
+                    $cleanupTree.Locks[$d.FullName].Dispose()
+                    try { [System.IO.Directory]::Delete($d.FullName, $false) } catch { Write-WinUtilISOLog -Level "WARN" -Message "Could not delete $($d.FullName): $_" }
                 }
 
-                try { Remove-Item -Path $workDir -Recurse -Force } catch { Write-WinUtilISOLog -Level "WARN" -Message "Could not delete temp directory ${WorkDir}: $_" }
+                $cleanupTree.Locks[$cleanupTree.Root].Dispose()
+                try { [System.IO.Directory]::Delete($cleanupTree.Root, $false) } catch { Write-WinUtilISOLog -Level "WARN" -Message "Could not delete temp directory ${WorkDir}: $_" }
 
                 if (Test-Path $workDir) {
                     Write-WinUtilISOLog -Level "WARN" -Message "Some items could not be deleted in $workDir"
@@ -648,6 +709,9 @@ function Invoke-WinUtilISOCleanAndReset {
             }
             Step-WinUtilJob -Hide
         } finally {
+            if ($null -ne $cleanupTree) {
+                foreach ($handle in $cleanupTree.Locks.Values) { $handle.Dispose() }
+            }
             Invoke-WPFUIThread -ScriptBlock {
                 $sync["WPFWin11ISOCleanResetButton"].IsEnabled = $true
 

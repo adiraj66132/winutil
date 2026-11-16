@@ -39,6 +39,8 @@ Use these when you have a specific issue to correct, not as a routine cleanup st
 * System Corruption Scan
 * WinGet Reinstall
 
+**Set Up Autologin** downloads the Microsoft utility into an administrator-protected cache under `%ProgramData%\WinUtilDownloads` and verifies its Authenticode signature before launching it. WinUtil refuses an existing cache directory or executable whose permissions allow ordinary users to control it.
+
 ## Legacy Windows Panels
 
 Open old-school Windows panels directly from WinUtil. Available panels include:
@@ -54,6 +56,8 @@ Open old-school Windows panels directly from WinUtil. Available panels include:
 ## Remote Access
 
 Enable an OpenSSH server on your Windows machine for remote access.
+
+Before starting SSH or opening its firewall rule, WinUtil checks the owners of existing `sshd_config` and `administrators_authorized_keys` files. Unrecognized owners are refused. Domain users whose security groups belong to local Administrators are accepted when Windows can resolve their transitive group memberships; if that lookup is unavailable, the check refuses the file rather than enabling SSH with an unverified owner.
 
 Only enable this if you intend to use remote shell access. After turning it on, verify your firewall rules and account permissions before exposing the machine to other devices.
 

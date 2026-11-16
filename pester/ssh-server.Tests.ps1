@@ -38,6 +38,7 @@ BeforeAll {
     }
 
     . (Join-Path $script:repoRoot "functions\private\Invoke-WinUtilSSHServer.ps1")
+    . (Join-Path $script:repoRoot "functions\private\Get-WinUtilAccountAuthorizationGroupSid.ps1")
 
     $script:defaultAdministratorsBlock = "Match Group administrators`n       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys`n"
     $script:overriddenAdministratorsBlock = "# Match Group administrators`n#        AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys`n"
@@ -94,6 +95,7 @@ Describe "Invoke-WinUtilSSHServer" {
 
         Mock Write-Host { }
         Mock Restart-Service { }
+        Mock Get-WinUtilAccountAuthorizationGroupSid { }
     }
 
     AfterEach {
@@ -216,5 +218,43 @@ Describe "Invoke-WinUtilSSHServer" {
         $keys | Should -HaveCount 2
         $keys | Should -Contain "ssh-ed25519 AAAAexisting server"
         $keys | Should -Contain "ssh-ed25519 AAAAnew laptop"
+    }
+
+    It "accepts an owner with nested domain membership in local Administrators" {
+        New-SshdConfig -AdministratorsBlock $script:defaultAdministratorsBlock | Out-Null
+        $ownerSid = 'S-1-5-21-999-999-999-1001'
+        $domainGroupSid = 'S-1-5-21-999-999-999-2001'
+        Mock Get-Acl { [pscustomobject]@{ Owner = $ownerSid } } -ParameterFilter { $LiteralPath -eq $script:sshdConfigPath }
+        Mock Get-LocalGroupMember { [pscustomobject]@{ SID = [Security.Principal.SecurityIdentifier]::new($domainGroupSid) } }
+        Mock Get-WinUtilAccountAuthorizationGroupSid { $domainGroupSid }
+
+        { Invoke-WinUtilSSHServer } | Should -Not -Throw
+        Should -Invoke Get-LocalGroupMember -Times 1 -Exactly -ParameterFilter { $SID.Value -eq 'S-1-5-32-544' }
+        Should -Invoke Get-WinUtilAccountAuthorizationGroupSid -Times 1 -Exactly -ParameterFilter { $UserSid -eq $ownerSid }
+    }
+
+    It "refuses pre-existing files not owned by Administrators, SYSTEM, or the current user" {
+        New-SshdConfig -AdministratorsBlock $script:defaultAdministratorsBlock | Out-Null
+        Set-Content -Path $script:authorizedKeysPath -Value "ssh-ed25519 AAAAplanted attacker"
+        Mock Get-Acl { [pscustomobject]@{ Owner = 'S-1-5-21-999-999-999-1001' } }
+
+        { Invoke-WinUtilSSHServer } | Should -Throw "*Refusing to adopt*"
+    }
+
+    It "does not start sshd or open the firewall when a pre-existing file is refused" {
+        New-SshdConfig -AdministratorsBlock $script:defaultAdministratorsBlock | Out-Null
+        Set-Content -Path $script:authorizedKeysPath -Value "ssh-ed25519 AAAAplanted attacker"
+        Mock Get-Acl { [pscustomobject]@{ Owner = 'S-1-5-21-999-999-999-1001' } }
+        Mock Set-Service { }
+        Mock Start-Service { }
+        Mock New-NetFirewallRule { }
+        Mock Set-NetFirewallRule { }
+
+        { Invoke-WinUtilSSHServer } | Should -Throw "*Refusing to adopt*"
+
+        Should -Invoke -CommandName Set-Service -Times 0 -Exactly
+        Should -Invoke -CommandName Start-Service -Times 0 -Exactly
+        Should -Invoke -CommandName New-NetFirewallRule -Times 0 -Exactly
+        Should -Invoke -CommandName Set-NetFirewallRule -Times 0 -Exactly
     }
 }

@@ -1,6 +1,6 @@
 function Invoke-WPFOOSU {
     Start-WinUtilJob -Name "OOSU" -Description "Downloading O&O ShutUp10++" -Parameters @{
-        DownloadPath = Join-Path $sync.winutildir "ooshutup10.exe"
+        DownloadPath = Get-WinUtilProtectedDownloadPath -Name 'ooshutup10.exe'
     } -ScriptBlock {
         param($DownloadPath)
 
@@ -16,6 +16,11 @@ function Invoke-WPFOOSU {
                 "$percent%"
             }
             Step-WinUtilJob -Status "Downloading O&O ShutUp10++ ($progress)" -Percent $percent
+        }
+
+        $signature = Get-AuthenticodeSignature -FilePath $DownloadPath
+        if ($signature.Status -ne 'Valid') {
+            throw "O&O ShutUp10++ download failed Authenticode verification ($($signature.Status))."
         }
 
         Step-WinUtilJob -Status "Launching O&O ShutUp10++" -Percent 100
